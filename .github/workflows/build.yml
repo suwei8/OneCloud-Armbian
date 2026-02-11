@@ -1,0 +1,275 @@
+name: Build OneCloud Armbian
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'OS Release'
+        required: true
+        default: 'bookworm'
+        type: choice
+        options:
+          - bookworm    # Debian 12
+          - trixie      # Debian 13
+          - noble       # Ubuntu 24.04 LTS
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'cli'
+        type: choice
+        options:
+          - minimal
+          - cli
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        default: 'current'
+        type: choice
+        options:
+          - current     # 6.12.x
+          - edge        # latest
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build.yml'
+      - 'userpatches/**'
+
+env:
+  UBOOT_REPO: hzyitc/u-boot-onecloud
+  UBOOT_RELEASE: latest
+  UBOOT_BURNIMG: eMMC.burn.img
+  ARMBIAN_REPO: armbian/build
+  ARMBIAN_REF: main
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-22.04
+    outputs:
+      env: ${{ steps.get.outputs.env }}
+    steps:
+      - id: get
+        name: Get build information
+        run: |
+          TIME="$(curl -s https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }} | jq -r .created_at)"
+          TAG="ci-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
+
+          UBOOT_TAG=$(curl -s https://api.github.com/repos/${UBOOT_REPO}/releases/${UBOOT_RELEASE} | jq -r .tag_name)
+          ARMBIAN_SHA=$(curl -s https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF} | jq -r .sha)
+
+          cat <<EOF | sed -E 's/^  //' >>$GITHUB_ENV
+            TIME=$TIME
+            TAG=$TAG
+            UBOOT_TAG=$UBOOT_TAG
+            ARMBIAN_SHA=$ARMBIAN_SHA
+          EOF
+          echo "env=$(cat $GITHUB_ENV | base64 -w 0)" >>$GITHUB_OUTPUT
+
+      - name: Show build information
+        run: |
+          echo "## Build Information" >>$GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')" >>$GITHUB_STEP_SUMMARY
+          echo "- **Armbian**: ${ARMBIAN_REPO}@${ARMBIAN_REF} (\`${ARMBIAN_SHA}\`)" >>$GITHUB_STEP_SUMMARY
+          echo "- **U-Boot**: ${UBOOT_REPO}@${UBOOT_TAG}" >>$GITHUB_STEP_SUMMARY
+          echo "- **Release**: ${{ inputs.release || 'bookworm' }}" >>$GITHUB_STEP_SUMMARY
+          echo "- **Type**: ${{ inputs.build_type || 'cli' }}" >>$GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ inputs.kernel_branch || 'current' }}" >>$GITHUB_STEP_SUMMARY
+
+      - name: Generate release notes
+        run: |
+          cat <<EOF | sed -E 's/^  //' | tee Release.md
+            ## OneCloud Armbian Build
+
+            **$(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')**
+
+            ### Sources
+            - Armbian: [${ARMBIAN_REPO}@${ARMBIAN_REF}](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_REF}) (\`${ARMBIAN_SHA}\`)
+            - U-Boot: [${UBOOT_REPO}@${UBOOT_TAG}](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_TAG})
+
+            ### Build Config
+            - Release: \`${{ inputs.release || 'bookworm' }}\`
+            - Type: \`${{ inputs.build_type || 'cli' }}\`
+            - Kernel: \`${{ inputs.kernel_branch || 'current' }}\`
+
+            ### SHA256
+          EOF
+
+          echo "NAME=OneCloud Armbian $(date -d "$TIME" +'%Y%m%d')" >>$GITHUB_ENV
+          tail --line=+2 Release.md >Body.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.NAME }}
+          body_path: Body.md
+
+  build-debs:
+    name: Build Kernel DEBs
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Import env
+        run: echo "$(echo "${{ needs.prepare.outputs.env }}" | base64 -d)" >>$GITHUB_ENV
+
+      - name: Checkout Armbian
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ARMBIAN_REPO }}
+          ref: ${{ env.ARMBIAN_SHA }}
+
+      - name: Copy userpatches
+        uses: actions/checkout@v4
+        with:
+          path: userpatches_overlay
+
+      - name: Apply userpatches
+        run: |
+          if [ -d userpatches_overlay/userpatches ]; then
+            cp -rv userpatches_overlay/userpatches/* userpatches/ 2>/dev/null || true
+          fi
+          rm -rf userpatches_overlay
+
+      - name: Build kernel
+        run: |
+          export GITHUB_ACTIONS=false
+          sudo --preserve-env \
+            ./compile.sh kernel \
+              ALLOW_ROOT=yes \
+              BOARD=onecloud \
+              BRANCH=${{ inputs.kernel_branch || 'current' }} \
+              EXPERT=yes \
+              USE_CCACHE=no
+          sudo chown $(id -u):$(id -g) -R output/
+
+      - name: Upload kernel DEBs
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ inputs.kernel_branch || 'current' }}
+          path: output/debs/*
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: output/debs/*
+
+  build:
+    name: Build Image
+    needs: [prepare, build-debs]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Import env
+        run: echo "$(echo "${{ needs.prepare.outputs.env }}" | base64 -d)" >>$GITHUB_ENV
+
+      - name: Checkout Armbian
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ARMBIAN_REPO }}
+          ref: ${{ env.ARMBIAN_SHA }}
+
+      - name: Copy userpatches
+        uses: actions/checkout@v4
+        with:
+          path: userpatches_overlay
+
+      - name: Apply userpatches
+        run: |
+          if [ -d userpatches_overlay/userpatches ]; then
+            cp -rv userpatches_overlay/userpatches/* userpatches/ 2>/dev/null || true
+          fi
+          rm -rf userpatches_overlay
+
+      - name: Download kernel DEBs
+        uses: actions/download-artifact@v4
+        with:
+          name: debs-${{ inputs.kernel_branch || 'current' }}
+          path: output/debs/
+
+      - name: Build image
+        run: |
+          export GITHUB_ACTIONS=false
+          sudo --preserve-env \
+            ./compile.sh build \
+              ALLOW_ROOT=yes \
+              BOARD=onecloud \
+              BRANCH=${{ inputs.kernel_branch || 'current' }} \
+              RELEASE=${{ inputs.release || 'bookworm' }} \
+              KERNEL_CONFIGURE=no \
+              BUILD_MINIMAL=${{ inputs.build_type == 'minimal' && 'yes' || 'no' }} \
+              BUILD_DESKTOP=no \
+              EXPERT=yes \
+              SKIP_EXTERNAL_TOOLCHAINS=yes \
+              CLEAN_LEVEL= \
+              USE_CCACHE=no \
+              COMPRESS_OUTPUTIMAGE=img
+          sudo chown $(id -u):$(id -g) -R output/
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y img2simg
+
+          ver="v0.3.1"
+          curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/$ver/AmlImg_${ver}_linux_amd64
+          chmod +x ./AmlImg
+
+      - name: Download u-boot
+        run: |
+          curl -L -o ./uboot.img https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG}
+          ./AmlImg unpack ./uboot.img burn/
+
+      - name: Generate burn image
+        run: |
+          diskimg=$(ls output/images/*.img)
+          loop=$(sudo losetup --find --show --partscan $diskimg)
+          sudo img2simg ${loop}p1 burn/boot.simg
+          sudo img2simg ${loop}p2 burn/rootfs.simg
+          sudo losetup -d $loop
+          sudo chown $(id -u):$(id -g) -R burn/
+
+          echo -n "sha1sum $(sha1sum burn/boot.simg | awk '{print $1}')" >burn/boot.VERIFY
+          echo -n "sha1sum $(sha1sum burn/rootfs.simg | awk '{print $1}')" >burn/rootfs.VERIFY
+
+          cat <<EOF >>burn/commands.txt
+          PARTITION:boot:sparse:boot.simg
+          VERIFY:boot:normal:boot.VERIFY
+          PARTITION:rootfs:sparse:rootfs.simg
+          VERIFY:rootfs:normal:rootfs.VERIFY
+          EOF
+
+          prefix=$(ls output/images/*.img | sed 's/\.img$//')
+          burnimg=${prefix}.burn.img
+          ./AmlImg pack $burnimg burn/
+
+      - name: Hash and compress
+        run: |
+          for f in output/images/*.img; do
+            sha256sum "$f" | tee -a sha256sum
+            xz --threads=0 --compress "$f"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.release || 'bookworm' }}-${{ inputs.kernel_branch || 'current' }}-${{ inputs.build_type || 'cli' }}
+          path: output/images/*
+
+      - name: Append SHA256 to release
+        run: |
+          cat <<EOF | sed -E 's/^  //' | tee Release.md
+            $(cat sha256sum | awk '{printf "%s: `%s`\\n", $2, $1}')
+          EOF
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          append_body: true
+          body_path: Release.md
+          files: output/images/*

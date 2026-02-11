@@ -1,0 +1,6 @@
+output/
+.tmp/
+*.img
+*.img.xz
+*.burn.img
+.env
