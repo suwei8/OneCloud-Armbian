@@ -36,7 +36,7 @@ on:
       - 'userpatches/**'
 
 env:
-  UBOOT_REPO: hzyitc/u-boot-onecloud
+  UBOOT_REPO: hzyitc/u-boot
   UBOOT_RELEASE: latest
   UBOOT_BURNIMG: eMMC.burn.img
   ARMBIAN_REPO: armbian/build
@@ -55,19 +55,23 @@ jobs:
       - id: get
         name: Get build information
         run: |
-          TIME="$(curl -s https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }} | jq -r .created_at)"
+          TIME="$(curl -fsSL https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }} | jq -r .created_at)"
           TAG="ci-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
 
-          UBOOT_TAG=$(curl -s https://api.github.com/repos/${UBOOT_REPO}/releases/${UBOOT_RELEASE} | jq -r .tag_name)
-          ARMBIAN_SHA=$(curl -s https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF} | jq -r .sha)
+          UBOOT_TAG=$(curl -fsSL https://api.github.com/repos/${UBOOT_REPO}/releases/${UBOOT_RELEASE} | jq -r .tag_name)
+          ARMBIAN_SHA=$(curl -fsSL https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF} | jq -r .sha)
 
           cat <<EOF | sed -E 's/^  //' >>$GITHUB_ENV
             TIME=$TIME
             TAG=$TAG
+            NAME=OneCloud Armbian $(date -d "$TIME" +'%Y%m%d')
             UBOOT_TAG=$UBOOT_TAG
             ARMBIAN_SHA=$ARMBIAN_SHA
           EOF
           echo "env=$(cat $GITHUB_ENV | base64 -w 0)" >>$GITHUB_OUTPUT
+
+          test "$UBOOT_TAG" != "null"
+          test -n "$ARMBIAN_SHA"
 
       - name: Show build information
         run: |
@@ -98,16 +102,7 @@ jobs:
             ### SHA256
           EOF
 
-          echo "NAME=OneCloud Armbian $(date -d "$TIME" +'%Y%m%d')" >>$GITHUB_ENV
           tail --line=+2 Release.md >Body.md
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ env.NAME }}
-          body_path: Body.md
 
   build-debs:
     name: Build Kernel DEBs
@@ -152,12 +147,6 @@ jobs:
         with:
           name: debs-${{ inputs.kernel_branch || 'current' }}
           path: output/debs/*
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          files: output/debs/*
 
   build:
     name: Build Image
@@ -216,12 +205,12 @@ jobs:
           sudo apt-get install -y img2simg
 
           ver="v0.3.1"
-          curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/$ver/AmlImg_${ver}_linux_amd64
+          curl -fL -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/$ver/AmlImg_${ver}_linux_amd64
           chmod +x ./AmlImg
 
       - name: Download u-boot
         run: |
-          curl -L -o ./uboot.img https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG}
+          curl -fL -o ./uboot.img https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG}
           ./AmlImg unpack ./uboot.img burn/
 
       - name: Generate burn image
@@ -266,10 +255,34 @@ jobs:
             $(cat sha256sum | awk '{printf "%s: `%s`\\n", $2, $1}')
           EOF
 
+      - name: Assemble release body
+        run: |
+          cat <<EOF | sed -E 's/^  //' | tee FullRelease.md
+            ## OneCloud Armbian Build
+
+            **$(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')**
+
+            ### Sources
+            - Armbian: [${ARMBIAN_REPO}@${ARMBIAN_REF}](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_REF}) (\`${ARMBIAN_SHA}\`)
+            - U-Boot: [${UBOOT_REPO}@${UBOOT_TAG}](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_TAG})
+
+            ### Build Config
+            - Release: \`${{ inputs.release || 'bookworm' }}\`
+            - Type: \`${{ inputs.build_type || 'cli' }}\`
+            - Kernel: \`${{ inputs.kernel_branch || 'current' }}\`
+
+            ### SHA256
+
+            $(cat Release.md)
+          EOF
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          append_body: true
-          body_path: Release.md
-          files: output/images/*
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.NAME }}
+          body_path: FullRelease.md
+          files: |
+            output/debs/*
+            output/images/*
