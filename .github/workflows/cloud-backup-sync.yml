@@ -1,0 +1,140 @@
+name: Cloud Backup Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_mode:
+        description: Sync mode
+        required: true
+        default: latest-only
+        type: choice
+        options:
+          - latest-only
+          - full-copy
+      dry_run:
+        description: Dry run
+        required: true
+        default: false
+        type: boolean
+  repository_dispatch:
+    types:
+      - onecloud-backup-uploaded
+  schedule:
+    - cron: "23 2 * * *"
+    - cron: "47 14 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    env:
+      RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
+      SOURCE_REMOTE: onedrive:OneCloudBackups/Vaultwarden/onecloud
+      DEST_REMOTE: gdrive:OneCloudBackups/Vaultwarden/onecloud
+      SYNC_MODE: ${{ github.event.inputs.sync_mode || 'latest-only' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      FORCE_FILE: ${{ github.event.client_payload.file || '' }}
+      FORCE_HOST: ${{ github.event.client_payload.host || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone jq
+
+      - name: Materialize rclone config
+        env:
+          RCLONE_SYNC_CONF: ${{ secrets.RCLONE_SYNC_CONF }}
+        run: |
+          test -n "$RCLONE_SYNC_CONF"
+          umask 077
+          printf '%s\n' "$RCLONE_SYNC_CONF" > "$RCLONE_CONFIG"
+          test -s "$RCLONE_CONFIG"
+
+      - name: Verify remotes
+        run: |
+          rclone lsd onedrive:
+          rclone lsd gdrive:
+
+      - name: Select backup object
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$FORCE_FILE" ]; then
+            printf 'file=%s\n' "$FORCE_FILE" >> "$GITHUB_OUTPUT"
+            printf 'host=%s\n' "$FORCE_HOST" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_json="$(rclone lsjson "$SOURCE_REMOTE" --files-only)"
+          latest_file="$(
+            printf '%s\n' "$latest_json" \
+            | jq -r 'sort_by(.ModTime) | reverse | .[0].Path // empty'
+          )"
+
+          if [ -z "$latest_file" ]; then
+            echo "No backup files found in $SOURCE_REMOTE" >&2
+            exit 1
+          fi
+
+          host_name="$(printf '%s' "$latest_file" | sed -E 's/^vaultwarden-db-([^-]+)-[0-9]{8}-[0-9]{6}\.tar\.gz$/\1/')"
+          printf 'file=%s\n' "$latest_file" >> "$GITHUB_OUTPUT"
+          printf 'host=%s\n' "$host_name" >> "$GITHUB_OUTPUT"
+
+      - name: Sync latest backup
+        if: env.SYNC_MODE == 'latest-only'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$SOURCE_REMOTE/${{ steps.select.outputs.file }}"
+          dst="$DEST_REMOTE/${{ steps.select.outputs.file }}"
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          rclone copyto "$src" "$dst" --transfers 1 --checkers 2 --retries 3 --low-level-retries 10 "${args[@]}"
+
+      - name: Sync full directory
+        if: env.SYNC_MODE == 'full-copy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          rclone copy "$SOURCE_REMOTE" "$DEST_REMOTE" --transfers 2 --checkers 4 --retries 3 --low-level-retries 10 "${args[@]}"
+
+      - name: Apply Google Drive retention
+        if: env.DRY_RUN != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keep_days="${{ vars.GDRIVE_KEEP_DAYS || '60' }}"
+          rclone delete "$DEST_REMOTE" --min-age "${keep_days}d" --rmdirs || true
+
+      - name: Write summary
+        run: |
+          {
+            echo "## Cloud Backup Sync"
+            echo "- Trigger: \`${{ github.event_name }}\`"
+            echo "- Mode: \`${SYNC_MODE}\`"
+            echo "- Dry run: \`${DRY_RUN}\`"
+            echo "- Source: \`${SOURCE_REMOTE}\`"
+            echo "- Destination: \`${DEST_REMOTE}\`"
+            if [ -n "${{ steps.select.outputs.file }}" ]; then
+              echo "- Selected file: \`${{ steps.select.outputs.file }}\`"
+            fi
+            if [ -n "${{ steps.select.outputs.host }}" ]; then
+              echo "- Host: \`${{ steps.select.outputs.host }}\`"
+            fi
+            if [ "${{ env.DRY_RUN }}" != "true" ]; then
+              echo "- GDrive retention: \`${{ vars.GDRIVE_KEEP_DAYS || '60' }} days\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
