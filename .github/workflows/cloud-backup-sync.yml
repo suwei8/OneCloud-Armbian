@@ -30,7 +30,6 @@ jobs:
   sync:
     runs-on: ubuntu-24.04
     env:
-      RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
       SOURCE_REMOTE: onedrive:OneCloudBackups/Vaultwarden/onecloud
       DEST_REMOTE: gdrive:OneCloudBackups/Vaultwarden/onecloud
       SYNC_MODE: ${{ github.event.inputs.sync_mode || 'latest-only' }}
@@ -48,6 +47,7 @@ jobs:
 
       - name: Materialize rclone config
         env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
           RCLONE_SYNC_CONF: ${{ secrets.RCLONE_SYNC_CONF }}
         run: |
           test -n "$RCLONE_SYNC_CONF"
@@ -56,6 +56,8 @@ jobs:
           test -s "$RCLONE_CONFIG"
 
       - name: Verify remotes
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
         run: |
           rclone lsd onedrive:
           rclone lsd gdrive:
@@ -63,6 +65,8 @@ jobs:
       - name: Select backup object
         id: select
         shell: bash
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
         run: |
           set -euo pipefail
 
@@ -90,6 +94,8 @@ jobs:
       - name: Sync latest backup
         if: env.SYNC_MODE == 'latest-only'
         shell: bash
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
         run: |
           set -euo pipefail
           src="$SOURCE_REMOTE/${{ steps.select.outputs.file }}"
@@ -103,6 +109,8 @@ jobs:
       - name: Sync full directory
         if: env.SYNC_MODE == 'full-copy'
         shell: bash
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
         run: |
           set -euo pipefail
           args=()
@@ -114,6 +122,8 @@ jobs:
       - name: Apply Google Drive retention
         if: env.DRY_RUN != 'true'
         shell: bash
+        env:
+          RCLONE_CONFIG: ${{ runner.temp }}/rclone.conf
         run: |
           set -euo pipefail
           keep_days="${{ vars.GDRIVE_KEEP_DAYS || '60' }}"
